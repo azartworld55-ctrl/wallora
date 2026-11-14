@@ -1,482 +1,74 @@
-import {
-  App,
-  Modal,
-  Notice,
-  Plugin,
-  PluginSettingTab,
-  Setting,
-  TFile,
-  normalizePath
-} from "obsidian";
-
-type WallpaperFit = "cover" | "contain" | "auto";
-type WallpaperPosition = "center" | "top" | "bottom" | "left" | "right";
-
-interface WalloraSettings {
-  wallpapers: string[];
-  activeWallpaper: string;
-  overlay: number;
-  imageOpacity: number;
-  blur: number;
-  fit: WallpaperFit;
-  position: WallpaperPosition;
-  autoRotate: boolean;
-  rotationMinutes: number;
-  randomOrder: boolean;
+import { App, Modal, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath } from "obsidian";
+type Fit = "cover" | "contain" | "auto";
+type Pos = "center" | "top" | "bottom" | "left" | "right";
+interface NoteStyle { path: string; opacity?: number; blur?: number; overlay?: number; }
+interface Profile { name: string; path: string; opacity: number; blur: number; overlay: number; gradient: string; useGradient: boolean; }
+interface Settings {
+  wallpapers: string[]; activeWallpaper: string; opacity: number; blur: number; overlay: number; fit: Fit; position: Pos;
+  autoRotate: boolean; rotationMinutes: number; randomOrder: boolean;
+  noteWallpapers: Record<string, NoteStyle>; folderWallpapers: Record<string,string>;
+  favorites: string[]; categories: Record<string,string>; history: string[];
+  profiles: Profile[]; gradient: string; useGradient: boolean; lightWallpaper: string; darkWallpaper: string;
 }
-
-const DEFAULT_SETTINGS: WalloraSettings = {
-  wallpapers: [],
-  activeWallpaper: "",
-  overlay: 0.28,
-  imageOpacity: 1,
-  blur: 0,
-  fit: "cover",
-  position: "center",
-  autoRotate: false,
-  rotationMinutes: 30,
-  randomOrder: true
-};
-
-const WALLPAPER_FOLDER = "Wallora";
-const IMAGE_EXTENSIONS = new Set(["png", "jpg", "jpeg", "webp", "gif", "avif"]);
-
+const DEFAULTS: Settings = { wallpapers:[],activeWallpaper:"",opacity:1,blur:0,overlay:.28,fit:"cover",position:"center",autoRotate:false,rotationMinutes:30,randomOrder:true,noteWallpapers:{},folderWallpapers:{},favorites:[],categories:{},history:[],profiles:[],gradient:"linear-gradient(135deg,#20243a,#5b426e)",useGradient:false,lightWallpaper:"",darkWallpaper:"" };
+const FOLDER="Wallora"; const EXT=new Set(["png","jpg","jpeg","webp","gif","avif"]);
 export default class WalloraPlugin extends Plugin {
-  settings: WalloraSettings;
-  private backgroundUrl = "";
-  private rotationTimer: number | null = null;
-
-  async onload(): Promise<void> {
-    await this.loadSettings();
-    this.addSettingTab(new WalloraSettingTab(this.app, this));
-    this.addRibbonIcon("image", "Open Wallora gallery", () => this.openGallery());
-    this.addCommand({
-      id: "open-gallery",
-      name: "Open wallpaper gallery",
-      callback: () => this.openGallery()
-    });
-    this.addCommand({
-      id: "next-wallpaper",
-      name: "Next wallpaper",
-      callback: () => this.nextWallpaper()
-    });
-    this.addCommand({
-      id: "random-wallpaper",
-      name: "Set a random wallpaper",
-      callback: () => this.setRandomWallpaper()
-    });
-    this.addCommand({
-      id: "toggle-wallpaper",
-      name: "Toggle wallpaper visibility",
-      callback: () => this.toggleWallpaper()
-    });
-    await this.applyWallpaper();
-    this.configureRotation();
-  }
-
-  onunload(): void {
-    this.clearRotation();
-    document.body.classList.remove("wallora-enabled");
-    document.body.style.removeProperty("--wallora-image");
-    if (this.backgroundUrl) URL.revokeObjectURL(this.backgroundUrl);
-  }
-
-  async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
-    this.settings.wallpapers = Array.isArray(this.settings.wallpapers)
-      ? this.settings.wallpapers.filter((path): path is string => typeof path === "string")
-      : [];
-  }
-
-  async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
-  }
-
-  async addWallpaper(file: File): Promise<void> {
-    const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
-    if (!IMAGE_EXTENSIONS.has(extension) || !file.type.startsWith("image/")) {
-      new Notice("Wallora: please choose a supported image file.");
-      return;
-    }
-
-    await this.app.vault.createFolder(WALLPAPER_FOLDER).catch(() => undefined);
-    const safeName = file.name.replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, "-");
-    const path = normalizePath(`${WALLPAPER_FOLDER}/${Date.now()}-${safeName}`);
-
-    try {
-      await this.app.vault.createBinary(path, await file.arrayBuffer());
-      this.settings.wallpapers.push(path);
-      if (!this.settings.activeWallpaper) this.settings.activeWallpaper = path;
-      await this.saveSettings();
-      await this.applyWallpaper();
-      new Notice(`Added “${file.name}” to Wallora.`);
-    } catch (error) {
-      console.error("Wallora: could not import wallpaper", error);
-      new Notice("Wallora could not save this image to your vault.");
-    }
-  }
-
-  async removeWallpaper(path: string): Promise<void> {
-    const file = this.app.vault.getAbstractFileByPath(path);
-    if (file instanceof TFile) {
-      try {
-        await this.app.vault.delete(file);
-      } catch (error) {
-        console.error("Wallora: could not delete wallpaper file", error);
-        new Notice("Could not remove the image file from your vault.");
-        return;
-      }
-    }
-
-    this.settings.wallpapers = this.settings.wallpapers.filter((item) => item !== path);
-    if (this.settings.activeWallpaper === path) {
-      this.settings.activeWallpaper = this.settings.wallpapers[0] ?? "";
-    }
-    await this.saveSettings();
-    await this.applyWallpaper();
-    new Notice("Wallpaper removed.");
-  }
-
-  async setActiveWallpaper(path: string): Promise<void> {
-    this.settings.activeWallpaper = path;
-    await this.saveSettings();
-    await this.applyWallpaper();
-    new Notice("Wallpaper applied.");
-  }
-
-  async applyWallpaper(): Promise<void> {
-    const path = this.settings.activeWallpaper;
-    const file = path ? this.app.vault.getAbstractFileByPath(path) : null;
-
-    if (!(file instanceof TFile)) {
-      document.body.classList.remove("wallora-enabled");
-      document.body.style.removeProperty("--wallora-image");
-      if (this.backgroundUrl) URL.revokeObjectURL(this.backgroundUrl);
-      this.backgroundUrl = "";
-      return;
-    }
-
-    try {
-      const data = await this.app.vault.readBinary(file);
-      const blob = new Blob([data], { type: this.mimeType(file.extension) });
-      const nextUrl = URL.createObjectURL(blob);
-      if (this.backgroundUrl) URL.revokeObjectURL(this.backgroundUrl);
-      this.backgroundUrl = nextUrl;
-
-      const style = document.body.style;
-      style.setProperty("--wallora-image", `url("${nextUrl}")`);
-      style.setProperty("--wallora-overlay", String(this.settings.overlay));
-      style.setProperty("--wallora-opacity", String(this.settings.imageOpacity));
-      style.setProperty("--wallora-blur", `${this.settings.blur}px`);
-      style.setProperty("--wallora-fit", this.settings.fit);
-      style.setProperty("--wallora-position", this.settings.position);
-      document.body.classList.add("wallora-enabled");
-    } catch (error) {
-      console.error("Wallora: could not load wallpaper", error);
-      new Notice("Wallora could not load the selected wallpaper.");
-    }
-  }
-
-  async setRandomWallpaper(): Promise<void> {
-    const choices = this.settings.wallpapers.filter((path) => path !== this.settings.activeWallpaper);
-    const pool = choices.length ? choices : this.settings.wallpapers;
-    if (!pool.length) {
-      new Notice("Add an image to your Wallora gallery first.");
-      return;
-    }
-    const next = pool[Math.floor(Math.random() * pool.length)];
-    await this.setActiveWallpaper(next);
-  }
-
-  async nextWallpaper(): Promise<void> {
-    const list = this.settings.wallpapers;
-    if (!list.length) {
-      new Notice("Your Wallora gallery is empty.");
-      return;
-    }
-    const index = list.indexOf(this.settings.activeWallpaper);
-    const nextIndex = index < 0 ? 0 : (index + 1) % list.length;
-    await this.setActiveWallpaper(list[nextIndex]);
-  }
-
-  async toggleWallpaper(): Promise<void> {
-    if (document.body.classList.contains("wallora-enabled")) {
-      document.body.classList.remove("wallora-enabled");
-      new Notice("Wallpaper hidden.");
-    } else if (this.settings.activeWallpaper) {
-      await this.applyWallpaper();
-    } else {
-      new Notice("Choose a wallpaper in the Wallora gallery first.");
-    }
-  }
-
-  configureRotation(): void {
-    this.clearRotation();
-    if (!this.settings.autoRotate || this.settings.wallpapers.length < 2) return;
-    const minutes = Math.max(1, this.settings.rotationMinutes);
-    this.rotationTimer = window.setInterval(() => {
-      if (this.settings.randomOrder) void this.setRandomWallpaper();
-      else void this.nextWallpaper();
-    }, minutes * 60 * 1000);
-  }
-
-  private clearRotation(): void {
-    if (this.rotationTimer !== null) {
-      window.clearInterval(this.rotationTimer);
-      this.rotationTimer = null;
-    }
-  }
-
-  openGallery(): void {
-    new WalloraGalleryModal(this.app, this).open();
-  }
-
-  private mimeType(extension: string): string {
-    const ext = extension.toLowerCase();
-    if (ext === "jpg") return "image/jpeg";
-    if (ext === "svg") return "image/svg+xml";
-    return `image/${ext}`;
-  }
+ settings:Settings; private globalUrl=""; private leafUrls=new Map<HTMLElement,string>(); private timer:number|null=null;
+ async onload(){
+  this.settings=Object.assign({},DEFAULTS,await this.loadData());
+  this.settings.noteWallpapers??={};this.settings.folderWallpapers??={};this.settings.favorites??=[];this.settings.categories??={};this.settings.history??=[];this.settings.profiles??=[];
+  this.addSettingTab(new WalloraSettings(this.app,this));this.addRibbonIcon("image","Открыть галерею Wallora",()=>this.gallery());
+  this.addCommand({id:"gallery",name:"Открыть галерею обоев",callback:()=>this.gallery()});
+  this.addCommand({id:"note-wallpaper",name:"Назначить обои текущей заметке",callback:()=>this.gallery("note")});
+  this.addCommand({id:"folder-wallpaper",name:"Назначить обои папке текущей заметки",callback:()=>this.gallery("folder")});
+  this.addCommand({id:"clear-note-wallpaper",name:"Убрать обои текущей заметки",callback:()=>this.clearNote()});
+  this.addCommand({id:"next-wallpaper",name:"Следующие общие обои",callback:()=>this.next()});
+  this.registerEvent(this.app.workspace.on("active-leaf-change",()=>void this.refreshNote()));
+  this.registerEvent(this.app.workspace.on("file-open",()=>void this.refreshNote()));
+  await this.applyGlobal();await this.refreshNote();this.rotate();
+ }
+ onunload(){this.stop();document.body.classList.remove("wallora-enabled","wallora-gradient");if(this.globalUrl)URL.revokeObjectURL(this.globalUrl);for(const u of this.leafUrls.values())URL.revokeObjectURL(u);this.leafUrls.clear();document.querySelectorAll(".workspace-leaf.wallora-note-bg,.workspace-leaf.wallora-note-gradient").forEach(e=>e.classList.remove("wallora-note-bg","wallora-note-gradient"));}
+ async save(){await this.saveData(this.settings);}
+ async url(path:string){const f=this.app.vault.getAbstractFileByPath(path);if(!(f instanceof TFile))return null;const b=await this.app.vault.readBinary(f);return URL.createObjectURL(new Blob([b],{type:f.extension==="jpg"?"image/jpeg":`image/${f.extension}`}));}
+ async add(file:File){const ext=file.name.split(".").pop()?.toLowerCase()??"";if(!EXT.has(ext)||!file.type.startsWith("image/"))return new Notice("Неподдерживаемый формат изображения.");await this.app.vault.createFolder(FOLDER).catch(()=>{});const path=normalizePath(`${FOLDER}/${Date.now()}-${file.name.replace(/[\\/:*?"<>|]/g,"-")}`);try{await this.app.vault.createBinary(path,await file.arrayBuffer());this.settings.wallpapers.push(path);if(!this.settings.activeWallpaper)this.settings.activeWallpaper=path;await this.save();await this.applyGlobal();await this.refreshNote();new Notice("Изображение добавлено.");}catch(e){console.error(e);new Notice("Не удалось сохранить изображение.");}}
+ async remove(path:string){const f=this.app.vault.getAbstractFileByPath(path);if(f instanceof TFile)await this.app.vault.delete(f);this.settings.wallpapers=this.settings.wallpapers.filter(x=>x!==path);this.settings.favorites=this.settings.favorites.filter(x=>x!==path);for(const [k,v] of Object.entries(this.settings.noteWallpapers))if(v.path===path)delete this.settings.noteWallpapers[k];for(const [k,v] of Object.entries(this.settings.folderWallpapers))if(v===path)delete this.settings.folderWallpapers[k];if(this.settings.activeWallpaper===path)this.settings.activeWallpaper=this.settings.wallpapers[0]??"";await this.save();await this.applyGlobal();await this.refreshNote();}
+ async applyGlobal(){if(this.globalUrl)URL.revokeObjectURL(this.globalUrl);this.globalUrl="";if(this.settings.useGradient){document.body.classList.remove("wallora-enabled");document.body.classList.add("wallora-gradient");document.body.style.setProperty("--wallora-gradient",this.settings.gradient);return;}document.body.classList.remove("wallora-gradient");if(!this.settings.activeWallpaper){document.body.classList.remove("wallora-enabled");return;}const u=await this.url(this.settings.activeWallpaper);if(!u)return;this.globalUrl=u;const s=document.body.style;s.setProperty("--wallora-image",`url("${u}")`);s.setProperty("--wallora-opacity",String(this.settings.opacity));s.setProperty("--wallora-overlay",String(this.settings.overlay));s.setProperty("--wallora-blur",this.settings.blur+"px");s.setProperty("--wallora-fit",this.settings.fit);s.setProperty("--wallora-position",this.settings.position);document.body.classList.add("wallora-enabled");}
+ private resolve(path:string){const own=this.settings.noteWallpapers[path];if(own)return own;let folder=path.includes("/")?path.slice(0,path.lastIndexOf("/")):"";while(folder){const p=this.settings.folderWallpapers[folder];if(p)return {path:p};folder=folder.includes("/")?folder.slice(0,folder.lastIndexOf("/")):"";}const theme=document.body.classList.contains("theme-light")?this.settings.lightWallpaper:this.settings.darkWallpaper;return {path:theme||this.settings.activeWallpaper};}
+ async refreshNote(){const leaf=this.app.workspace.activeLeaf;if(!leaf)return;const el=leaf.view.containerEl.closest(".workspace-leaf") as HTMLElement|null;if(!el)return;const old=this.leafUrls.get(el);if(old){URL.revokeObjectURL(old);this.leafUrls.delete(el);}el.classList.remove("wallora-note-bg","wallora-note-gradient");el.style.removeProperty("--wallora-note-image");const file=this.app.workspace.getActiveFile();if(!file)return;const style=this.resolve(file.path);if(this.settings.useGradient&&!this.settings.noteWallpapers[file.path]&&!this.settings.folderWallpapers[file.parent?.path??""]){el.classList.add("wallora-note-gradient");el.style.setProperty("--wallora-note-gradient",this.settings.gradient);return;}if(!style.path)return;try{const u=await this.url(style.path);if(!u)return;this.leafUrls.set(el,u);el.style.setProperty("--wallora-note-image",`url("${u}")`);el.style.setProperty("--wallora-note-opacity",String(style.opacity??this.settings.opacity));el.style.setProperty("--wallora-note-blur",(style.blur??this.settings.blur)+"px");el.style.setProperty("--wallora-note-overlay",String(style.overlay??this.settings.overlay));el.style.setProperty("--wallora-note-fit",this.settings.fit);el.style.setProperty("--wallora-note-position",this.settings.position);el.classList.add("wallora-note-bg");}catch(e){console.error(e);}}
+ async assign(path:string,mode:"note"|"folder"|"global"){const file=this.app.workspace.getActiveFile();if(mode==="note"&&!file)return new Notice("Сначала открой заметку.");if(mode==="folder"&&!file?.parent)return new Notice("У заметки нет папки.");if(mode==="note")this.settings.noteWallpapers[file!.path]={path};else if(mode==="folder")this.settings.folderWallpapers[file!.parent!.path]=path;else{this.settings.activeWallpaper=path;this.settings.useGradient=false;this.settings.history=[path,...this.settings.history.filter(x=>x!==path)].slice(0,30);}await this.save();await this.applyGlobal();await this.refreshNote();new Notice(mode==="note"?"Обои заметки установлены.":mode==="folder"?"Обои папки установлены.":"Обои рабочего пространства установлены.");}
+ async clearNote(){const f=this.app.workspace.getActiveFile();if(!f)return new Notice("Сначала открой заметку.");delete this.settings.noteWallpapers[f.path];await this.save();await this.refreshNote();new Notice("Индивидуальные обои заметки сброшены.");}
+ async next(){const a=this.settings.wallpapers;if(!a.length)return new Notice("Галерея пуста.");const i=a.indexOf(this.settings.activeWallpaper);await this.assign(a[(i+1)%a.length],"global");}
+ async favorite(path:string){this.settings.favorites=this.settings.favorites.includes(path)?this.settings.favorites.filter(x=>x!==path):[...this.settings.favorites,path];await this.save();}
+ async saveProfile(){const name=window.prompt("Название профиля:");if(!name?.trim())return;this.settings.profiles.push({name:name.trim(),path:this.settings.activeWallpaper,opacity:this.settings.opacity,blur:this.settings.blur,overlay:this.settings.overlay,gradient:this.settings.gradient,useGradient:this.settings.useGradient});await this.save();new Notice("Профиль сохранён.");}
+ async useProfile(p:Profile){Object.assign(this.settings,{activeWallpaper:p.path,opacity:p.opacity,blur:p.blur,overlay:p.overlay,gradient:p.gradient,useGradient:p.useGradient});await this.save();await this.applyGlobal();await this.refreshNote();new Notice("Профиль применён.");}
+ rotate(){this.stop();if(!this.settings.autoRotate||this.settings.wallpapers.length<2)return;this.timer=window.setInterval(()=>{if(this.settings.randomOrder){const a=this.settings.wallpapers.filter(x=>x!==this.settings.activeWallpaper);if(a.length)void this.assign(a[Math.floor(Math.random()*a.length)],"global");}else void this.next();},Math.max(1,this.settings.rotationMinutes)*60000);}
+ private stop(){if(this.timer!==null)window.clearInterval(this.timer);this.timer=null;}
+ gallery(mode:"note"|"folder"|"global"="global"){new WalloraGallery(this.app,this,mode).open();}
 }
-
-class WalloraGalleryModal extends Modal {
-  private previewUrls: string[] = [];
-
-  constructor(app: App, private plugin: WalloraPlugin) {
-    super(app);
-    this.modalEl.addClass("wallora-modal");
-  }
-
-  onOpen(): void {
-    void this.renderGallery();
-  }
-
-  onClose(): void {
-    this.previewUrls.forEach((url) => URL.revokeObjectURL(url));
-    this.previewUrls = [];
-    this.contentEl.empty();
-  }
-
-  private async renderGallery(): Promise<void> {
-    this.previewUrls.forEach((url) => URL.revokeObjectURL(url));
-    this.previewUrls = [];
-    const { contentEl } = this;
-    contentEl.empty();
-
-    const header = contentEl.createDiv({ cls: "wallora-modal-header" });
-    header.createEl("h2", { text: "Wallora gallery" });
-    const addButton = header.createEl("button", { text: "＋ Add wallpapers", cls: "mod-cta" });
-    const fileInput = header.createEl("input", { type: "file" });
-    fileInput.type = "file";
-    fileInput.accept = "image/png,image/jpeg,image/webp,image/gif,image/avif";
-    fileInput.multiple = true;
-    fileInput.hidden = true;
-    addButton.addEventListener("click", () => fileInput.click());
-    fileInput.addEventListener("change", async () => {
-      const files = Array.from(fileInput.files ?? []);
-      for (const file of files) await this.plugin.addWallpaper(file);
-      fileInput.value = "";
-      await this.renderGallery();
-    });
-
-    contentEl.createEl("p", {
-      cls: "wallora-modal-description",
-      text: "Choose an image to make it your workspace background. Your images are stored locally in the Wallora folder of this vault."
-    });
-
-    const gallery = contentEl.createDiv({ cls: "wallora-gallery" });
-    const paths = this.plugin.settings.wallpapers;
-
-    if (!paths.length) {
-      gallery.createDiv({
-        cls: "wallora-empty",
-        text: "Your gallery is empty. Add an image to give your workspace a new atmosphere."
-      });
-      return;
-    }
-
-    for (const path of paths) {
-      const file = this.app.vault.getAbstractFileByPath(path);
-      if (!(file instanceof TFile)) continue;
-
-      const card = gallery.createDiv({
-        cls: `wallora-card${this.plugin.settings.activeWallpaper === path ? " is-active" : ""}`
-      });
-      const image = card.createEl("img", { attr: { alt: file.basename } });
-      try {
-        const data = await this.app.vault.readBinary(file);
-        const url = URL.createObjectURL(new Blob([data], { type: this.imageMime(file.extension) }));
-        this.previewUrls.push(url);
-        image.src = url;
-      } catch {
-        image.alt = "Preview unavailable";
-      }
-
-      const meta = card.createDiv({ cls: "wallora-card-meta" });
-      meta.createSpan({ cls: "wallora-card-name", text: file.basename });
-      const actions = meta.createDiv({ cls: "wallora-card-actions" });
-      const apply = actions.createEl("button", {
-        text: this.plugin.settings.activeWallpaper === path ? "Active" : "Set wallpaper",
-        cls: this.plugin.settings.activeWallpaper === path ? "mod-cta" : ""
-      });
-      apply.disabled = this.plugin.settings.activeWallpaper === path;
-      apply.addEventListener("click", async (event) => {
-        event.stopPropagation();
-        await this.plugin.setActiveWallpaper(path);
-        await this.renderGallery();
-      });
-
-      const remove = actions.createEl("button", { text: "Remove" });
-      remove.addEventListener("click", async (event) => {
-        event.stopPropagation();
-        const confirmed = window.confirm(`Remove “${file.basename}” from Wallora and delete its copy from this vault?`);
-        if (!confirmed) return;
-        await this.plugin.removeWallpaper(path);
-        await this.renderGallery();
-      });
-
-      card.addEventListener("click", async () => {
-        await this.plugin.setActiveWallpaper(path);
-        await this.renderGallery();
-      });
-    }
-  }
-
-  private imageMime(extension: string): string {
-    const ext = extension.toLowerCase();
-    return ext === "jpg" ? "image/jpeg" : `image/${ext}`;
-  }
+class WalloraGallery extends Modal{
+ private urls:string[]=[];
+ constructor(app:App,private p:WalloraPlugin,private mode:"note"|"folder"|"global"){super(app);this.modalEl.addClass("wallora-modal");}
+ onClose(){this.urls.forEach(URL.revokeObjectURL);this.urls=[];this.contentEl.empty();}
+ onOpen(){void this.render();}
+ async render(){this.urls.forEach(URL.revokeObjectURL);this.urls=[];const root=this.contentEl;root.empty();const h=root.createDiv({cls:"wallora-modal-header"});h.createEl("h2",{text:this.mode==="note"?"Обои заметки":this.mode==="folder"?"Обои папки":"Галерея Wallora"});const add=h.createEl("button",{text:"＋ Добавить изображения",cls:"mod-cta"});const input=h.createEl("input",{type:"file"});input.accept="image/*";input.multiple=true;input.hidden=true;add.onclick=()=>input.click();input.onchange=async()=>{for(const f of Array.from(input.files??[]))await this.p.add(f);input.value="";await this.render();};root.createEl("p",{text:"Файлы хранятся локально в папке Wallora вашего хранилища.",cls:"wallora-modal-description"});const filter=root.createEl("select");[["all","Все"],["fav","Избранное"],["nature","Природа"],["abstract","Абстракция"],["space","Космос"],["other","Другое"]].forEach(([v,l])=>filter.add(new Option(l,v)));const grid=root.createDiv({cls:"wallora-gallery"});const draw=async()=>{grid.empty();const paths=this.p.settings.wallpapers.filter(x=>filter.value==="all"||(filter.value==="fav"?this.p.settings.favorites.includes(x):this.p.settings.categories[x]===filter.value));if(!paths.length){grid.createDiv({cls:"wallora-empty",text:"Здесь пока пусто. Добавь изображения или отметь их избранными."});return;}for(const path of paths){const f=this.app.vault.getAbstractFileByPath(path);if(!(f instanceof TFile))continue;const card=grid.createDiv({cls:"wallora-card"});const img=card.createEl("img",{attr:{alt:f.basename}});try{const u=await this.p.url(path);if(u){this.urls.push(u);img.src=u;}}catch{}img.onclick=()=>{const m=new Modal(this.app);m.modalEl.addClass("wallora-preview");m.onOpen=()=>{m.contentEl.createEl("img",{attr:{src:img.src,alt:f.basename}});m.contentEl.createEl("p",{text:f.basename});};m.open();};const meta=card.createDiv({cls:"wallora-card-meta"});meta.createSpan({cls:"wallora-card-name",text:f.basename});const actions=meta.createDiv({cls:"wallora-card-actions"});actions.createEl("button",{text:this.mode==="global"?"Установить":this.mode==="note"?"Для заметки":"Для папки"}).onclick=async()=>{await this.p.assign(path,this.mode);if(this.mode!=="global")this.close();};actions.createEl("button",{text:this.p.settings.favorites.includes(path)?"★":"☆"}).onclick=async()=>{await this.p.favorite(path);await draw();};const cat=actions.createEl("select");[["other","Другое"],["nature","Природа"],["abstract","Абстракция"],["space","Космос"]].forEach(([v,l])=>cat.add(new Option(l,v)));cat.value=this.p.settings.categories[path]??"other";cat.onchange=async()=>{this.p.settings.categories[path]=cat.value;await this.p.save();};actions.createEl("button",{text:"Удалить"}).onclick=async()=>{if(window.confirm("Удалить изображение из галереи и хранилища?")){await this.p.remove(path);await draw();}};}};filter.onchange=()=>void draw();await draw();}
 }
-
-class WalloraSettingTab extends PluginSettingTab {
-  constructor(app: App, private plugin: WalloraPlugin) {
-    super(app, plugin);
-  }
-
-  display(): void {
-    const { containerEl } = this;
-    containerEl.empty();
-    containerEl.createEl("h2", { text: "Wallora" });
-    containerEl.createEl("p", {
-      text: "Make your Obsidian workspace feel like yours. All wallpaper files stay in this vault."
-    });
-
-    new Setting(containerEl)
-      .setName("Wallpaper gallery")
-      .setDesc(`${this.plugin.settings.wallpapers.length} image(s) in your gallery`)
-      .addButton((button) => button
-        .setButtonText("Open gallery")
-        .setCta()
-        .onClick(() => this.plugin.openGallery()));
-
-    new Setting(containerEl)
-      .setName("Image opacity")
-      .setDesc("Adjust the visibility of the wallpaper.")
-      .addSlider((slider) => slider
-        .setLimits(0.1, 1, 0.05)
-        .setValue(this.plugin.settings.imageOpacity)
-        .setDynamicTooltip()
-        .onChange(async (value) => {
-          this.plugin.settings.imageOpacity = value;
-          await this.plugin.saveSettings();
-          await this.plugin.applyWallpaper();
-        }));
-
-    new Setting(containerEl)
-      .setName("Overlay darkness")
-      .setDesc("Add a dark layer above the image to keep text readable.")
-      .addSlider((slider) => slider
-        .setLimits(0, 0.85, 0.05)
-        .setValue(this.plugin.settings.overlay)
-        .setDynamicTooltip()
-        .onChange(async (value) => {
-          this.plugin.settings.overlay = value;
-          await this.plugin.saveSettings();
-          await this.plugin.applyWallpaper();
-        }));
-
-    new Setting(containerEl)
-      .setName("Background blur")
-      .setDesc("A subtle blur can help reduce visual distraction.")
-      .addSlider((slider) => slider
-        .setLimits(0, 20, 1)
-        .setValue(this.plugin.settings.blur)
-        .setDynamicTooltip()
-        .onChange(async (value) => {
-          this.plugin.settings.blur = value;
-          await this.plugin.saveSettings();
-          await this.plugin.applyWallpaper();
-        }));
-
-    new Setting(containerEl)
-      .setName("Image sizing")
-      .setDesc("Choose how the wallpaper fills the available space.")
-      .addDropdown((dropdown) => dropdown
-        .addOption("cover", "Fill screen")
-        .addOption("contain", "Fit entire image")
-        .addOption("auto", "Original size")
-        .setValue(this.plugin.settings.fit)
-        .onChange(async (value: WallpaperFit) => {
-          this.plugin.settings.fit = value;
-          await this.plugin.saveSettings();
-          await this.plugin.applyWallpaper();
-        }));
-
-    new Setting(containerEl)
-      .setName("Image position")
-      .addDropdown((dropdown) => dropdown
-        .addOption("center", "Center")
-        .addOption("top", "Top")
-        .addOption("bottom", "Bottom")
-        .addOption("left", "Left")
-        .addOption("right", "Right")
-        .setValue(this.plugin.settings.position)
-        .onChange(async (value: WallpaperPosition) => {
-          this.plugin.settings.position = value;
-          await this.plugin.saveSettings();
-          await this.plugin.applyWallpaper();
-        }));
-
-    containerEl.createEl("h3", { text: "Automatic rotation" });
-
-    new Setting(containerEl)
-      .setName("Enable automatic rotation")
-      .setDesc("Automatically switch to another wallpaper.")
-      .addToggle((toggle) => toggle
-        .setValue(this.plugin.settings.autoRotate)
-        .onChange(async (value) => {
-          this.plugin.settings.autoRotate = value;
-          await this.plugin.saveSettings();
-          this.plugin.configureRotation();
-        }));
-
-    new Setting(containerEl)
-      .setName("Rotation interval")
-      .setDesc("Time between wallpaper changes, in minutes.")
-      .addText((text) => text
-        .setPlaceholder("30")
-        .setValue(String(this.plugin.settings.rotationMinutes))
-        .onChange(async (value) => {
-          const parsed = Number.parseInt(value, 10);
-          if (!Number.isFinite(parsed) || parsed < 1) return;
-          this.plugin.settings.rotationMinutes = Math.min(parsed, 10080);
-          await this.plugin.saveSettings();
-          this.plugin.configureRotation();
-        }));
-
-    new Setting(containerEl)
-      .setName("Random order")
-      .setDesc("Choose a random image instead of following the gallery order.")
-      .addToggle((toggle) => toggle
-        .setValue(this.plugin.settings.randomOrder)
-        .onChange(async (value) => {
-          this.plugin.settings.randomOrder = value;
-          await this.plugin.saveSettings();
-        }));
-
-    containerEl.createEl("p", {
-      cls: "setting-item-description",
-      text: "Tip: use the command palette to open the gallery, move to the next wallpaper, choose a random wallpaper, or hide the current background."
-    });
-  }
+class WalloraSettings extends PluginSettingTab{
+ constructor(app:App,private p:WalloraPlugin){super(app,p);}
+ display(){const e=this.containerEl;e.empty();e.createEl("h2",{text:"Wallora — настройки"});e.createEl("p",{text:"Персональные обои для рабочего пространства, заметок и папок."});
+ new Setting(e).setName("Галерея обоев").setDesc(`${this.p.settings.wallpapers.length} изображений`).addButton(b=>b.setButtonText("Открыть").setCta().onClick(()=>this.p.gallery()));
+ new Setting(e).setName("Обои текущей заметки").setDesc("Индивидуальный фон для редактора и режима чтения").addButton(b=>b.setButtonText("Выбрать").onClick(()=>this.p.gallery("note"))).addButton(b=>b.setButtonText("Сбросить").onClick(()=>void this.p.clearNote()));
+ new Setting(e).setName("Обои папки").setDesc("Заметки наследуют фон папки, если у них нет собственного").addButton(b=>b.setButtonText("Выбрать").onClick(()=>this.p.gallery("folder")));
+ new Setting(e).setName("Прозрачность").addSlider(s=>s.setLimits(.1,1,.05).setValue(this.p.settings.opacity).setDynamicTooltip().onChange(async v=>{this.p.settings.opacity=v;await this.p.save();await this.p.applyGlobal();await this.p.refreshNote();}));
+ new Setting(e).setName("Затемнение").addSlider(s=>s.setLimits(0,.85,.05).setValue(this.p.settings.overlay).setDynamicTooltip().onChange(async v=>{this.p.settings.overlay=v;await this.p.save();await this.p.applyGlobal();await this.p.refreshNote();}));
+ new Setting(e).setName("Размытие").addSlider(s=>s.setLimits(0,20,1).setValue(this.p.settings.blur).setDynamicTooltip().onChange(async v=>{this.p.settings.blur=v;await this.p.save();await this.p.applyGlobal();await this.p.refreshNote();}));
+ new Setting(e).setName("Масштаб").addDropdown(d=>d.addOption("cover","Заполнить").addOption("contain","Вместить").addOption("auto","Исходный размер").setValue(this.p.settings.fit).onChange(async v=>{this.p.settings.fit=v as Fit;await this.p.save();await this.p.refreshNote();await this.p.applyGlobal();}));
+ new Setting(e).setName("Положение").addDropdown(d=>d.addOption("center","По центру").addOption("top","Сверху").addOption("bottom","Снизу").addOption("left","Слева").addOption("right","Справа").setValue(this.p.settings.position).onChange(async v=>{this.p.settings.position=v as Pos;await this.p.save();await this.p.refreshNote();await this.p.applyGlobal();}));
+ e.createEl("h3",{text:"Градиенты и профили"});new Setting(e).setName("Использовать градиент").addToggle(t=>t.setValue(this.p.settings.useGradient).onChange(async v=>{this.p.settings.useGradient=v;await this.p.save();await this.p.applyGlobal();await this.p.refreshNote();}));
+ new Setting(e).setName("CSS-градиент").setDesc("Например: linear-gradient(135deg, #20243a, #5b426e)").addText(t=>t.setValue(this.p.settings.gradient).onChange(async v=>{this.p.settings.gradient=v;await this.p.save();await this.p.applyGlobal();await this.p.refreshNote();}));
+ new Setting(e).setName("Сохранить профиль").addButton(b=>b.setButtonText("Сохранить").onClick(()=>void this.p.saveProfile()));this.p.settings.profiles.forEach(p=>new Setting(e).setName(p.name).addButton(b=>b.setButtonText("Применить").onClick(()=>void this.p.useProfile(p))).addButton(b=>b.setButtonText("Удалить").onClick(async()=>{this.p.settings.profiles=this.p.settings.profiles.filter(x=>x!==p);await this.p.save();this.display();})));
+ e.createEl("h3",{text:"Автоматическая смена"});new Setting(e).setName("Включить").addToggle(t=>t.setValue(this.p.settings.autoRotate).onChange(async v=>{this.p.settings.autoRotate=v;await this.p.save();this.p.rotate();}));
+ new Setting(e).setName("Интервал (минуты)").addText(t=>t.setValue(String(this.p.settings.rotationMinutes)).onChange(async v=>{const n=Number(v);if(n>=1&&Number.isFinite(n)){this.p.settings.rotationMinutes=Math.min(n,10080);await this.p.save();this.p.rotate();}}));
+ new Setting(e).setName("Случайный порядок").addToggle(t=>t.setValue(this.p.settings.randomOrder).onChange(async v=>{this.p.settings.randomOrder=v;await this.p.save();}));
+ new Setting(e).setName("История").setDesc(this.p.settings.history.slice(0,8).map(x=>x.split("/").pop()).join(" · ")||"Пока пуста.");
+ }
 }
