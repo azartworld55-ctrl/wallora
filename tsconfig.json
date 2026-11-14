@@ -10,7 +10,6 @@
     "moduleResolution": "node",
     "importHelpers": true,
     "removeComments": true,
-    "preserveので": false,
     "lib": ["DOM", "ES2020"],
     "strictNullChecks": true,
     "allowSyntheticDefaultImports": true,
