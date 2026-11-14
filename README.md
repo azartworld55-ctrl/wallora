@@ -41,6 +41,17 @@ Once Wallora is approved and listed in the Obsidian Community Plugins directory:
 
 Imported images are copied into the vault's `Wallora/` folder. Removing an image from the gallery also removes its managed copy from that folder.
 
+## Releases
+
+Push a version tag such as `v1.0.0` to build the plugin and publish a GitHub Release containing `main.js`, `manifest.json`, and `styles.css`:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+GitHub Actions also builds the plugin on pushes and pull requests. The compiled bundle is available as a workflow artifact.
+
 ## Development
 
 Requirements: Node.js 18+ and npm.
