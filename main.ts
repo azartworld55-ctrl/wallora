@@ -329,6 +329,8 @@ class WalloraGalleryModal extends Modal {
       const remove = actions.createEl("button", { text: "Remove" });
       remove.addEventListener("click", async (event) => {
         event.stopPropagation();
+        const confirmed = window.confirm(`Remove “${file.basename}” from Wallora and delete its copy from this vault?`);
+        if (!confirmed) return;
         await this.plugin.removeWallpaper(path);
         await this.renderGallery();
       });
